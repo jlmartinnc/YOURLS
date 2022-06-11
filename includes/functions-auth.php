@@ -7,6 +7,7 @@
 /**
  * Show login form if required
  *
+ * @return void
  */
 function yourls_maybe_require_auth() {
 	if( yourls_is_private() ) {
@@ -20,6 +21,7 @@ function yourls_maybe_require_auth() {
 /**
  * Check for valid user via login form or stored cookie. Returns true or an error message
  *
+ * @return bool|string|mixed true if valid user, error message otherwise. Can also call yourls_die() or redirect to login page. Oh my.
  */
 function yourls_is_valid_user() {
 	// Allow plugins to short-circuit the whole function
@@ -32,9 +34,11 @@ function yourls_is_valid_user() {
 	$unfiltered_valid = false;
 
 	// Logout request
-	if( isset( $_GET['action'] ) && $_GET['action'] == 'logout' ) {
+	if( isset( $_GET['action'] ) && $_GET['action'] == 'logout' && isset( $_REQUEST['nonce'] ) ) {
+        // The logout nonce is associated to fake user 'logout' since at this point we don't know the real user
+        yourls_verify_nonce('admin_logout', $_REQUEST['nonce'], 'logout');
 		yourls_do_action( 'logout' );
-		yourls_store_cookie( null );
+		yourls_store_cookie( '' );
 		return yourls__( 'Logged out successfully' );
 	}
 
@@ -121,6 +125,7 @@ function yourls_is_valid_user() {
 /**
  * Check auth against list of login=>pwd. Sets user if applicable, returns bool
  *
+ * @return bool  true if login/pwd pair is valid (and sets user if applicable), false otherwise
  */
 function yourls_check_username_password() {
 	global $yourls_user_passwords;
@@ -140,8 +145,11 @@ function yourls_check_username_password() {
 /**
  * Check a submitted password sent in plain text against stored password which can be a salted hash
  *
+ * @param string $user
+ * @param string $submitted_password
+ * @return bool
  */
-function yourls_check_password_hash( $user, $submitted_password ) {
+function yourls_check_password_hash($user, $submitted_password ) {
 	global $yourls_user_passwords;
 
 	if( !isset( $yourls_user_passwords[ $user ] ) )
@@ -170,11 +178,15 @@ function yourls_check_password_hash( $user, $submitted_password ) {
  * @return true|string  if overwrite was successful, an error message otherwise
  */
 function yourls_hash_passwords_now( $config_file ) {
-	if( !is_readable( $config_file ) )
-		return 'cannot read file'; // not sure that can actually happen...
+	if( !is_readable( $config_file ) ) {
+        yourls_debug_log( 'Cannot hash passwords: cannot read file ' . $config_file );
+        return 'cannot read file'; // not sure that can actually happen...
+    }
 
-	if( !is_writable( $config_file ) )
+	if( !is_writable( $config_file ) ) {
+        yourls_debug_log( 'Cannot hash passwords: cannot write file ' . $config_file );
 		return 'cannot write file';
+    }
 
     $yourls_user_passwords = [];
 	// Include file to read value of $yourls_user_passwords
@@ -185,11 +197,16 @@ function yourls_hash_passwords_now( $config_file ) {
 	error_reporting( $errlevel );
 
 	$configdata = file_get_contents( $config_file );
-	if( $configdata == false )
-		return 'could not read file';
+
+    if( $configdata == false ) {
+        yourls_debug_log('Cannot hash passwords: file_get_contents() false with ' . $config_file);
+        return 'could not read file';
+    }
 
 	$to_hash = 0; // keep track of number of passwords that need hashing
 	foreach ( $yourls_user_passwords as $user => $password ) {
+        // avoid "deprecated" warning when password is null -- see test case in tests/data/auth/preg_replace_problem.php
+        $password ??= '';
 		if ( !yourls_has_phpass_password( $user ) && !yourls_has_md5_password( $user ) ) {
 			$to_hash++;
 			$hash = yourls_phpass_hash( $password );
@@ -208,8 +225,10 @@ function yourls_hash_passwords_now( $config_file ) {
 		}
 	}
 
-	if( $to_hash == 0 )
-		return 0; // There was no password to encrypt
+	if( $to_hash == 0 ) {
+        yourls_debug_log('Cannot hash passwords: no password found in ' . $config_file);
+        return 'no password found';
+    }
 
 	$success = file_put_contents( $config_file, $configdata );
 	if ( $success === FALSE ) {
@@ -317,6 +336,7 @@ function yourls_has_phpass_password( $user ) {
 /**
  * Check auth against encrypted COOKIE data. Sets user if applicable, returns bool
  *
+ * @return bool true if authenticated, false otherwise
  */
 function yourls_check_auth_cookie() {
 	global $yourls_user_passwords;
@@ -403,6 +423,8 @@ function yourls_check_signature() {
 /**
  * Generate secret signature hash
  *
+ * @param false|string $username  Username to generate signature for, or false to use current user
+ * @return string                 Signature
  */
 function yourls_auth_signature( $username = false ) {
 	if( !$username && defined('YOURLS_USER') ) {
@@ -414,6 +436,8 @@ function yourls_auth_signature( $username = false ) {
 /**
  * Check if timestamp is not too old
  *
+ * @param int $time  Timestamp to check
+ * @return bool      True if timestamp is valid
  */
 function yourls_check_timestamp( $time ) {
 	$now = time();
@@ -424,9 +448,10 @@ function yourls_check_timestamp( $time ) {
 /**
  * Store new cookie. No $user will delete the cookie.
  *
- * @param mixed $user  String, user login, or null to delete cookie
+ * @param string $user  User login, or empty string to delete cookie
+ * @return void
  */
-function yourls_store_cookie( $user = null ) {
+function yourls_store_cookie( $user = '' ) {
 
     // No user will delete the cookie with a cookie time from the past
 	if( !$user ) {
@@ -444,6 +469,8 @@ function yourls_store_cookie( $user = null ) {
 	if ( $domain == 'localhost' )
 		$domain = '';
 
+	yourls_do_action( 'pre_setcookie', $user, $time, $path, $domain, $secure, $httponly );
+
     if ( !headers_sent( $filename, $linenum ) ) {
         yourls_setcookie( yourls_cookie_name(), yourls_cookie_value( $user ), $time, $path, $domain, $secure, $httponly );
 	} else {
@@ -458,7 +485,6 @@ function yourls_store_cookie( $user = null ) {
  *
  * @see https://github.com/GoogleChromeLabs/samesite-examples/blob/master/php.md
  * @see https://stackoverflow.com/a/59654832/36850
- * @see https://3v4l.org/uKEtH for compat tests
  * @see https://www.php.net/manual/en/function.setcookie.php
  *
  * @since  1.7.7
@@ -474,24 +500,21 @@ function yourls_store_cookie( $user = null ) {
 function yourls_setcookie($name, $value, $expire, $path, $domain, $secure, $httponly) {
     $samesite = yourls_apply_filter('setcookie_samesite', 'Lax' );
 
-    if (PHP_VERSION_ID < 70300) {
-        return(setcookie($name, $value, $expire, "$path; samesite=$samesite", $domain, $secure, $httponly));
-    }
-    else {
-        return(setcookie($name, $value, array(
-            'expires'  => $expire,
-            'path'     => $path,
-            'domain'   => $domain,
-            'samesite' => $samesite,
-            'secure'   => $secure,
-            'httponly' => $httponly,
-        )));
-    }
+    return(setcookie($name, $value, array(
+        'expires'  => $expire,
+        'path'     => $path,
+        'domain'   => $domain,
+        'samesite' => $samesite,
+        'secure'   => $secure,
+        'httponly' => $httponly,
+    )));
 }
 
 /**
  * Set user name
  *
+ * @param string $user  Username
+ * @return void
  */
 function yourls_set_user( $user ) {
 	if( !defined( 'YOURLS_USER' ) )
@@ -549,7 +572,7 @@ function yourls_cookie_name() {
  * @return string          cookie value
  */
 function yourls_cookie_value( $user ) {
-	return yourls_apply_filter( 'set_cookie_value', yourls_salt( $user ), $user );
+	return yourls_apply_filter( 'set_cookie_value', yourls_salt( $user ?? '' ), $user );
 }
 
 /**
@@ -557,27 +580,51 @@ function yourls_cookie_value( $user ) {
  *
  * Actually, this returns a float: ceil rounds up a value but is of type float, see https://www.php.net/ceil
  *
+ * @return float
  */
 function yourls_tick() {
 	return ceil( time() / yourls_get_nonce_life() );
 }
 
 /**
- * Return salted string
+ * Return hashed string
  *
+ * This function is badly named, it's not a salt or a salted string : it's a cryptographic hash.
+ *
+ * @since 1.4.1
+ * @param string $string   string to salt
+ * @return string          hashed string
  */
 function yourls_salt( $string ) {
 	$salt = defined('YOURLS_COOKIEKEY') ? YOURLS_COOKIEKEY : md5(__FILE__) ;
-	return yourls_apply_filter( 'yourls_salt', md5 ($string . $salt), $string );
+	return yourls_apply_filter( 'yourls_salt', hash_hmac( yourls_hmac_algo(), $string,  $salt), $string );
+}
+
+/**
+ * Return an available hash_hmac() algorithm
+ *
+ * @since 1.8.3
+ * @return string  hash_hmac() algorithm
+ */
+function yourls_hmac_algo() {
+    $algo = yourls_apply_filter( 'hmac_algo', 'sha256' );
+    if( !in_array( $algo, hash_hmac_algos() ) ) {
+        $algo = 'sha256';
+    }
+    return $algo;
 }
 
 /**
  * Create a time limited, action limited and user limited token
  *
+ * @param string $action      Action to create nonce for
+ * @param false|string $user  Optional user string, false for current user
+ * @return string             Nonce token
  */
-function yourls_create_nonce( $action, $user = false ) {
-	if( false == $user )
-		$user = defined( 'YOURLS_USER' ) ? YOURLS_USER : '-1';
+function yourls_create_nonce($action, $user = false ) {
+	if( false === $user ) {
+        $user = defined('YOURLS_USER') ? YOURLS_USER : '-1';
+    }
 	$tick = yourls_tick();
 	$nonce = substr( yourls_salt($tick . $action . $user), 0, 10 );
 	// Allow plugins to alter the nonce
@@ -585,10 +632,15 @@ function yourls_create_nonce( $action, $user = false ) {
 }
 
 /**
- * Create a nonce field for inclusion into a form
+ * Echoes or returns a nonce field for inclusion into a form
  *
+ * @param string $action      Action to create nonce for
+ * @param string $name        Optional name of nonce field -- defaults to 'nonce'
+ * @param false|string $user  Optional user string, false if unspecified
+ * @param bool $echo          True to echo, false to return nonce field
+ * @return string             Nonce field
  */
-function yourls_nonce_field( $action, $name = 'nonce', $user = false, $echo = true ) {
+function yourls_nonce_field($action, $name = 'nonce', $user = false, $echo = true ) {
 	$field = '<input type="hidden" id="'.$name.'" name="'.$name.'" value="'.yourls_create_nonce( $action, $user ).'" />';
 	if( $echo )
 		echo $field."\n";
@@ -598,8 +650,13 @@ function yourls_nonce_field( $action, $name = 'nonce', $user = false, $echo = tr
 /**
  * Add a nonce to a URL. If URL omitted, adds nonce to current URL
  *
+ * @param string $action      Action to create nonce for
+ * @param string $url         Optional URL to add nonce to -- defaults to current URL
+ * @param string $name        Optional name of nonce field -- defaults to 'nonce'
+ * @param false|string $user  Optional user string, false if unspecified
+ * @return string             URL with nonce added
  */
-function yourls_nonce_url( $action, $url = false, $name = 'nonce', $user = false ) {
+function yourls_nonce_url($action, $url = false, $name = 'nonce', $user = false ) {
 	$nonce = yourls_create_nonce( $action, $user );
 	return yourls_add_query_arg( $name, $nonce, $url );
 }
@@ -607,29 +664,35 @@ function yourls_nonce_url( $action, $url = false, $name = 'nonce', $user = false
 /**
  * Check validity of a nonce (ie time span, user and action match).
  *
- * Returns true if valid, dies otherwise (yourls_die() or die($return) if defined)
- * if $nonce is false or unspecified, it will use $_REQUEST['nonce']
+ * Returns true if valid, dies otherwise (yourls_die() or die($return) if defined).
+ * If $nonce is false or unspecified, it will use $_REQUEST['nonce']
  *
+ * @param string $action
+ * @param false|string $nonce  Optional, string: nonce value, or false to use $_REQUEST['nonce']
+ * @param false|string $user   Optional, string user, false for current user
+ * @param string $return       Optional, string: message to die with if nonce is invalid
+ * @return bool|void           True if valid, dies otherwise
  */
-function yourls_verify_nonce( $action, $nonce = false, $user = false, $return = '' ) {
-	// get user
-	if( false == $user )
-		$user = defined( 'YOURLS_USER' ) ? YOURLS_USER : '-1';
+function yourls_verify_nonce($action, $nonce = false, $user = false, $return = '' ) {
+	// Get user
+	if( false === $user ) {
+        $user = defined('YOURLS_USER') ? YOURLS_USER : '-1';
+    }
 
-	// get current nonce value
-	if( false == $nonce && isset( $_REQUEST['nonce'] ) )
-		$nonce = $_REQUEST['nonce'];
+	// Get nonce value from $_REQUEST if not specified
+	if( false === $nonce && isset( $_REQUEST['nonce'] ) ) {
+        $nonce = $_REQUEST['nonce'];
+    }
 
 	// Allow plugins to short-circuit the rest of the function
-	$valid = yourls_apply_filter( 'verify_nonce', false, $action, $nonce, $user, $return );
-	if ($valid) {
+	if (yourls_apply_filter( 'verify_nonce', false, $action, $nonce, $user, $return ) === true) {
 		return true;
 	}
 
-	// what nonce should be
+	// What nonce should be
 	$valid = yourls_create_nonce( $action, $user );
 
-	if( $nonce == $valid ) {
+	if( $nonce === $valid ) {
 		return true;
 	} else {
 		if( $return )
@@ -642,7 +705,7 @@ function yourls_verify_nonce( $action, $nonce = false, $user = false, $return = 
  * Check if YOURLS_USER comes from environment variables
  *
  * @since 1.8.2
- * @return bool     true if YOURLS_USER and YOURLS_PASSWORD are defined as environment variables
+ * @return bool  true if YOURLS_USER and YOURLS_PASSWORD are defined as environment variables
  */
 function yourls_is_user_from_env() {
 	return yourls_apply_filter('is_user_from_env', getenv('YOURLS_USER') && getenv('YOURLS_PASSWORD'));
@@ -654,7 +717,7 @@ function yourls_is_user_from_env() {
  *
  * By default, passwords are hashed. They are not if
  *    - there is no password in clear text in the config file (ie everything is already hashed)
- *    - the user defined constant YOURLS_NO_HASH_PASSWORD is true, see https://github.com/YOURLS/YOURLS/wiki/Username-Passwords#but-i-dont-want-to-encrypt-my-password-
+ *    - the user defined constant YOURLS_NO_HASH_PASSWORD is true, see https://docs.yourls.org/guide/essentials/credentials.html#i-don-t-want-to-encrypt-my-password
  *    - YOURLS_USER and YOURLS_PASSWORD are provided by the environment, not the config file
  *
  * @since 1.8.2
